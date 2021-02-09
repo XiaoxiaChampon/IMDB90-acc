@@ -1,0 +1,259 @@
+#import packages
+import csv
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+import os
+import tarfile
+import wget
+
+from typing import NamedTuple, Tuple, Dict
+from pandas import DataFrame
+from functools import partial
+
+
+#define functions
+DataMeta = NamedTuple('DataMeta', [
+    ('name', str), ('url', str)])
+
+
+_IMDB = DataMeta(
+    name='imdb',
+    url='https://www.dropbox.com/s/l9pj9hy2ans3phi/imdb.tar.gz?dl=1')
+
+def _download_data_if_needed(datas_meta: DataMeta) -> str:
+    """
+    Download and extract dataset if needed
+    return the path to the dataset
+    """
+    path = os.path.join('C:\\NCSU PhD\\data scientist bootcamp\\week14', datas_meta.name)
+    zip_path = path + '.tar.gz'
+
+    if os.path.exists(path):
+        print('data already available, skip downloading.')
+    else:
+        print('start downloading...')
+        wget.download(datas_meta.url, zip_path)
+
+        print('start extracting compressed files...')
+        with tarfile.open(zip_path) as tar:
+            tar.extractall('C:\\NCSU PhD\\data scientist bootcamp\\week14')
+        os.remove(zip_path)
+
+        print('data files are now available at %s' % path)
+    return path
+
+
+def _get_train_test_df(data_meta: DataMeta) -> Tuple[DataFrame, DataFrame]:
+    path = _download_data_if_needed(data_meta)
+    train, test = tuple(
+        pd.read_csv(os.path.join(path, file))
+        for file in ['train.csv', 'test.csv'])
+    print('{} loaded successfully.'.format(data_meta.name))
+    return train, test
+
+
+get_imdb_dataset = partial(_get_train_test_df, _IMDB)
+
+
+# Function for loading imdb dataset
+def load_imdb():
+    train, test = get_imdb_dataset()
+    TEXT_COL, LABEL_COL = 'text', 'sentiment'
+    return (
+        train[TEXT_COL], train[LABEL_COL],
+        test[TEXT_COL], test[LABEL_COL])
+
+train_text, train_label, test_text, test_label = load_imdb()
+
+# Check Shape, should not throw exceptions
+for data in train_text, train_label, test_text, test_label:
+    assert data.shape == (25000,)
+
+## Prepare Data 
+
+### Build Vectorizer
+
+Instead of building vocabulary on our own, we will use the build-in method for generating vocabulary and doing vectorization provided by `TfidfVectorizer` from Sklearn. Before you continue reading, I would suggest you take a look at the documentation for `TfidfVectorizer` available [here](https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html).
+
+**Note**: 
+
+It's always a good practice to read the documentation carefully instead of simply grab something and plug it in your project. It's important to understand what options are available and what is the default behavior. The rule of thumb is that, if you don't know what is the exact behavior of something, don't use it. Otherwise, get ready for endless time of debugging 🧐
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+tfidf_vectorizer = TfidfVectorizer(
+    min_df=2, # ignore word that only appears in 1 document
+    ngram_range=(1, 2), # consider both uni-gram and bi-gram
+)
+
+# Learn (fit) and transform text into vector
+train_x = tfidf_vectorizer.fit_transform(train_text)
+
+# Convert label to 0 and 1 (optional)
+train_y = train_label.apply(lambda x: 1 if x == 'pos' else 0)
+
+# Check the shape
+print('Training x shape:', train_x.shape)
+print('Training y shape:', train_y.shape)
+
+Worry about the size of the vocabulary? Stay calm, we will take care of this horrible dimention later.
+
+# Expect 12500 for 1 and 0, instead of pos and neg
+train_y.value_counts()
+
+# Apply the same transformer to validation set as well
+# Simply call `transform` this time, don't do `fit` again
+test_x = tfidf_vectorizer.transform(test_text)
+test_y = test_label.apply(lambda x: 1 if x == 'pos' else 0)
+
+# Sanity check
+assert test_x.shape == train_x.shape
+assert test_y.shape == train_y.shape
+
+### Dimensionality Reduction
+
+There are a couple of ways to reduce the dimensionality. During the class, we introduced two ways. 
+
+- One is to set a hard cut off on the number words in our vocabulary. In class, we only kept the top 3000 frequent words in the vocabulary. 
+- The other way is to use a pretrained word embeddings. This is based on transfer learning, where we reduce the dimensions by learning the relation between words from another training task (e.g.: Word2Vec). 
+
+So what's the pro and cons for both methods?
+
+- One defact about the first approach is that it didn't make use of the labels, i.e.: the dimensionality reduction was applied solely on information about the text. "Top words are more useful" is nothing more than one of our hypothesis. We have no idea on what words are more useful when doing classification.
+- The second approach is better. But one potential problem is that we kept it fixed, meaning that it may not fit in to our problem very well. One solution is to re-train the word embedding together with the weights of the network (simply set `trainable=True`). The training may take a long time thus a GPU is highly recommended.
+
+In this notebook, we decided to use another more general way to reduce dimensionality. We will be using `SelectKBest` from `sklearn` and using `f_classif` to help up pick up k best features (word). 
+
+from sklearn.feature_selection import SelectKBest
+
+DIM = 20000 # Dimensions to keep, a hyper parameter
+
+# Create a feature selector
+# By default, f_classif algorithm is used
+# Other available options include mutual_info_classif, chi2, f_regression etc. 
+
+selector = SelectKBest(k=20000)
+
+# The feature selector also requires information from labels
+# Fit on training data
+selector.fit(train_x, train_y)
+
+# Apply to both training data and testing data
+train_x = selector.transform(train_x)
+test_x = selector.transform(test_x)
+
+type(train_x)
+
+type(train_y)
+
+# Sanity check
+assert train_x.shape == (25000, 20000)
+assert test_x.shape == (25000, 20000)
+
+## Build a MLP Model
+
+Muti-Layer Perceptron model, aka Feed Forward Network, is the most basic neural network structure, but is used in quite a lot of place as it is very robust. It is true that deep networks are usually more powerful, but they are usually more data hungry. Since we don't have much data, a MLP model may works better in this case.
+
+from tensorflow.keras.models import Model
+from tensorflow.python.keras.layers import Input, Dense, Dropout
+
+import tensorflow as tf
+tf.__version__
+
+# This is quite similar to `build_nn_model` in previous notebook,
+# except that we add an extra dropout layer after each dense layer
+
+def build_mlp_model(input_dim, layers, output_dim, dropout_rate=0.2):
+    # Input layer
+    X = Input(shape=(input_dim,))
+    
+    # Hidden layer(s)
+    H = X
+    for layer in layers:
+        H = Dense(layer, activation='relu')(H)
+        H = Dropout(rate=dropout_rate)(H)
+    
+    # Output layer
+    activation_func = 'softmax' if output_dim > 1 else 'sigmoid'
+    
+    Y = Dense(output_dim, activation=activation_func)(H)
+    return Model(inputs=X, outputs=Y)
+
+hyper_params = {
+    'learning_rate': 1e-3,  # default for Adam
+    'epochs': 1000,
+    'batch_size': 64,
+    'layers': [64, 32],
+    'dim': DIM,
+    'dropout_rate': 0.5,
+}
+
+mlp_model = build_mlp_model(
+    input_dim=hyper_params['dim'],
+    layers=hyper_params['layers'],
+    output_dim=1,
+    dropout_rate=hyper_params['dropout_rate'],
+)
+
+mlp_model.summary()
+
+## Compile the Model
+
+from tensorflow.keras.optimizers import Adam
+
+mlp_model.compile(
+    optimizer=Adam(lr=hyper_params['learning_rate']),
+    loss='binary_crossentropy',
+    metrics=['acc'],
+)
+
+## Callbacks
+
+Callbacks (aka hooks) are functions called every N epochs that help you monitor and log the training process. By default, they will be called every 1 epoch. We will be using two common callbacks here: `EarlyStopping` and `ModelCheckpoint`. The first is used to prevent overfitting and the second is used to keep track of the best models we got so far.
+
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+ModelCheckpoint?
+
+early_stoppping_hook = EarlyStopping(
+    monitor='val_loss',  # what metrics to track
+    patience=2,  # maximum number of epochs allowed without imporvement on monitored metrics 
+)
+
+CPK_PATH = 'model_cpk.hdf5'    # path to store checkpoint
+
+model_cpk_hook = ModelCheckpoint(
+    CPK_PATH,
+    monitor='val_loss', 
+    save_best_only=True,  # Only keep the best model
+)
+
+## Train the Model, Hope for the Best
+
+his = mlp_model.fit(
+    train_x.todense(), 
+    train_y.values, 
+    epochs=10,
+    validation_data=[test_x.todense(), test_y.values],
+    batch_size=hyper_params['batch_size'],
+    callbacks=[early_stoppping_hook, model_cpk_hook],
+)
+
+print('Training finished') 
+
+## Evaluation
+
+Load the best model and do evaluation:
+
+
+
+# Load the model checkpoint
+mlp_model.load_weights(CPK_PATH)
+
+# Accuracy on validation 
+mlp_model.evaluate(test_x.todense(), test_y)
+
+ It's normal that the exact number may different as there are some randomization introduced during batching.
